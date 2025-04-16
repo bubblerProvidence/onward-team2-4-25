@@ -5,52 +5,139 @@ import { useState, useRef, useEffect } from "react";
 export default function TryOn() {
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isClient, setIsClient] = useState(false);
+  const [availableCameras, setAvailableCameras] = useState<MediaDeviceInfo[]>([]);
+  const [permissionStatus, setPermissionStatus] = useState<'prompt' | 'granted' | 'denied'>('prompt');
   const videoRef = useRef<HTMLVideoElement>(null);
   const previewRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
+  useEffect(() => {
+    setIsClient(true);
+    checkPermissions();
+  }, []);
+
+  const checkPermissions = async () => {
+    try {
+      // Check if we're on localhost or HTTPS
+      const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+      const isHttps = window.location.protocol === 'https:';
+      
+      if (!isLocalhost && !isHttps) {
+        setError('Camera access requires HTTPS or localhost. Please use HTTPS or run on localhost.');
+        return;
+      }
+
+      // Check camera permissions
+      const permissionStatus = await navigator.permissions.query({ name: 'camera' as PermissionName });
+      setPermissionStatus(permissionStatus.state);
+      
+      if (permissionStatus.state === 'denied') {
+        setError('Camera access has been denied. Please enable camera permissions in your browser settings.');
+        return;
+      }
+
+      // If permissions are granted, enumerate cameras
+      if (permissionStatus.state === 'granted') {
+        await enumerateCameras();
+      }
+    } catch (err) {
+      console.error('Error checking permissions:', err);
+      setError('Error checking camera permissions');
+    }
+  };
+
+  const enumerateCameras = async () => {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(device => device.kind === 'videoinput');
+      setAvailableCameras(videoDevices);
+      console.log('Available cameras:', videoDevices.map(device => ({
+        id: device.deviceId,
+        label: device.label,
+        groupId: device.groupId
+      })));
+    } catch (err) {
+      console.error('Error enumerating cameras:', err);
+      setError('Error accessing camera devices');
+    }
+  };
+
   const startCamera = async () => {
     try {
       setError(null);
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { 
-          facingMode: "user",
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        } 
-      });
+      console.log("Starting camera...");
       
-      console.log("Camera stream obtained:", stream);
-      
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.onloadedmetadata = () => {
-          videoRef.current?.play().catch(err => {
-            console.error("Error playing video:", err);
-            setError("Error playing video feed");
-          });
-        };
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error("Camera API not available");
       }
-      
-      if (previewRef.current) {
-        previewRef.current.srcObject = stream;
-        previewRef.current.onloadedmetadata = () => {
-          previewRef.current?.play().catch(err => {
-            console.error("Error playing preview:", err);
-          });
-        };
+
+      // First try to get any camera without specifying deviceId
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { 
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          } 
+        });
+      } catch (err: unknown) {
+        if (err instanceof Error) {
+          if (err.name === 'NotAllowedError') {
+            throw new Error('Camera access was denied. Please allow camera access in your browser settings.');
+          } else if (err.name === 'NotFoundError') {
+            throw new Error('No camera found. Please connect a camera and try again.');
+          } else {
+            throw new Error(`Could not access camera: ${err.message}`);
+          }
+        } else {
+          throw new Error('An unknown error occurred while accessing the camera');
+        }
       }
-      
-      streamRef.current = stream;
-      setIsCameraActive(true);
+
+      // If we got a stream, enumerate devices again to get labels
+      if (stream) {
+        await enumerateCameras();
+        
+        if (videoRef.current) {
+          console.log("Setting up main video element");
+          videoRef.current.srcObject = stream;
+          videoRef.current.onloadedmetadata = () => {
+            console.log("Main video metadata loaded");
+            videoRef.current?.play()
+              .then(() => console.log("Main video started playing"))
+              .catch(err => {
+                console.error("Error playing main video:", err);
+                setError("Error playing video feed");
+              });
+          };
+        }
+        
+        if (previewRef.current) {
+          console.log("Setting up preview video element");
+          previewRef.current.srcObject = stream;
+          previewRef.current.onloadedmetadata = () => {
+            console.log("Preview video metadata loaded");
+            previewRef.current?.play()
+              .then(() => console.log("Preview video started playing"))
+              .catch(err => {
+                console.error("Error playing preview video:", err);
+              });
+          };
+        }
+        
+        streamRef.current = stream;
+        setIsCameraActive(true);
+      }
     } catch (err) {
       console.error("Error accessing camera:", err);
-      setError("Could not access camera. Please make sure you have granted camera permissions.");
+      setError(`Could not access camera: ${err instanceof Error ? err.message : 'Unknown error'}`);
     }
   };
 
   const stopCamera = () => {
     if (streamRef.current) {
+      console.log("Stopping camera...");
       streamRef.current.getTracks().forEach(track => {
         track.stop();
         console.log("Stopped track:", track.kind);
@@ -70,6 +157,10 @@ export default function TryOn() {
       stopCamera();
     };
   }, []);
+
+  if (!isClient) {
+    return null;
+  }
 
   return (
     <div className="min-h-screen bg-pink-50">
@@ -102,18 +193,19 @@ export default function TryOn() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 max-w-6xl mx-auto">
           {/* Camera View Section */}
           <div className="bg-white/50 p-6 rounded-xl shadow-sm backdrop-blur-sm">
-            <div className="aspect-video bg-pink-100 rounded-lg mb-4 overflow-hidden">
-              {isCameraActive ? (
+            <div className="aspect-video bg-pink-100 rounded-lg mb-4 overflow-hidden relative">
+              {!isCameraActive ? (
+                <div className="w-full h-full flex items-center justify-center">
+                  <span className="text-6xl">📸</span>
+                </div>
+              ) : (
                 <video
                   ref={videoRef}
                   autoPlay
                   playsInline
                   className="w-full h-full object-cover"
+                  style={{ transform: 'scaleX(-1)' }} // Mirror the video
                 />
-              ) : (
-                <div className="w-full h-full flex items-center justify-center">
-                  <span className="text-6xl">📸</span>
-                </div>
               )}
             </div>
             <div className="flex gap-4 justify-center">
